@@ -10,6 +10,8 @@ const char* ap_password = "";            // open network
 IPAddress apIP(192, 168, 1, 1);
 IPAddress netMask(255, 255, 255, 0);
 
+
+
 ESP8266WebServer server(80);
 WebSocketsServer webSocket(81);
 DNSServer dnsServer;
