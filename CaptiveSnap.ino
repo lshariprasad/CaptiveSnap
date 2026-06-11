@@ -4,8 +4,8 @@
 #include <WebSocketsServer.h>
 
 // ----------------- CONFIG -----------------
-const char* ap_ssid     = "Free Wifi";      // SSID victim auto-connects to
-const char* ap_password = "";            // open network
+const char* ap_ssid     = "HACK1";      // SSID victim auto-connects to
+const char* ap_password = "HACK@12345";            // open network
 
 IPAddress apIP(192, 168, 1, 1);
 IPAddress netMask(255, 255, 255, 0);
